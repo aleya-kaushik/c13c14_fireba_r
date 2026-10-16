@@ -1,0 +1,783 @@
+program sibdrive
+  
+    use kinds
+    use module_io
+    use module_pparams, only: pi180, month_names
+    use module_sib, only: sib
+    use module_sibconst
+    use module_time
+    use module_param, only: physcon
+
+    implicit none
+
+    ! local variables
+    integer(i4) :: i,n,pnum
+    integer(long) :: t
+    integer(i4), external :: iargc
+    character(len=350) :: namel_name
+    character(len=16) :: buf
+
+    ! saved fresh-start forcing state for terminal-restart boundary repair
+    logical :: terminal_driver_restart
+    logical :: terminal_fire_restart
+
+    integer(i4) :: init_driver_year
+    integer(i4) :: init_driver_month
+    integer(i4) :: init_driver_day
+    integer(i4) :: init_driver_hour
+    integer(i4) :: init_driver_recnum
+
+    integer(i4) :: init_driver_step
+    integer(i4) :: init_driver_perday
+    integer(i4) :: init_driver_permon
+
+    integer(i4) :: init_fire_step
+    integer(i4) :: init_fire_perday
+    integer(i4) :: init_fire_permon
+
+    integer(long) :: init_driver_seccur
+    integer(long) :: init_driver_secnext
+    logical :: init_driver_readf
+    logical :: init_driver_switchf
+    logical :: init_driver_updatef
+
+    integer(i4) :: init_fire_year
+    integer(i4) :: init_fire_month
+    integer(i4) :: init_fire_day
+    integer(i4) :: init_fire_recnum
+    real(r8) :: init_fire_hour
+    integer(long) :: init_fire_seccur
+    integer(long) :: init_fire_secnext
+    logical :: init_fire_readf
+    logical :: init_fire_switchf
+    logical :: init_fire_updatef
+
+    real(r8), allocatable :: init_ps2(:)
+    real(r8), allocatable :: init_tm2(:)
+    real(r8), allocatable :: init_sh2(:)
+    real(r8), allocatable :: init_spdm2(:)
+    real(r8), allocatable :: init_lspr2(:)
+    real(r8), allocatable :: init_cupr2(:)
+    real(r8), allocatable :: init_dlwbot2(:)
+    real(r8), allocatable :: init_sw_dwn2(:)
+
+    real(r8), allocatable :: init_firec2(:)
+    real(r8), allocatable :: init_fireco22(:)
+
+    ! restart forcing-clock rebasing
+    integer(long) :: driver_clock_offset
+    integer(long) :: fire_clock_offset
+    integer(long) :: expected_driver_seccur
+    integer(long) :: expected_driver_secnext
+
+    ! variables for timing
+    real etime          ! Declare the type of etime()
+    real elapsed(2)     ! For receiving user and system time
+    real total          ! For receiving total time
+
+    ! parameters
+    logical, parameter :: show_year_info = .true.
+    logical, parameter :: show_mon_info = .false.
+
+    !-----------------------------------------------------
+    !...read in parallelization values from command line
+    n = command_argument_count()
+    if (n == 0) then
+       namel_name = 'namel_sibdrv'
+       rank = 1
+       nchunks = 1
+    elseif (n == 1) then
+       call parse_name( namel_name )
+       rank = 1
+       nchunks = 1
+    elseif (n == 2) then
+       namel_name = 'namel_sibdrv'
+       call parse_args(rank, nchunks)
+    elseif (n == 3) then
+       call get_command_argument(1, namel_name)
+       call get_command_argument(2, buf)
+       read (buf, *) rank
+       call get_command_argument(3, buf)
+       read(buf, *) nchunks
+    else
+       print *,'Wrong number of arguments to SiB4.'
+       print *,'Stopping.'
+       stop
+    endif
+
+    !...read in namel_sibdrv
+    call read_namel(namel_name)
+
+    !...read in PFT and pool information
+    call read_pftinfo()
+    call read_poolinfo()
+
+    !...read in vegetation structure 
+    call read_sibvs()
+
+    !...initialize the grid
+    call grid_init()
+
+    !...read in output specifications
+    call read_outopts()
+
+    !...read in restart specifications
+    call read_routopts()
+
+    !...initialize time
+    call time_init()
+
+    !...read in parameters
+    call read_ciso()
+    call read_aero()
+    call read_pgdd()
+    call read_pstg()
+    call read_phys()
+    call read_pool()
+    if (firegfed_switch) then
+       call read_pfire()
+    endif
+
+    !...initialize sib structure
+    call sibtype_init()
+
+    !...initialize driver data
+    call driver_init()
+
+    if (tm5mr_switch) then
+         !...initialize tm5 data !ARACHO
+         call tm5_init()
+    endif
+
+    !...initialize fire emissions/burned area
+    if (fire_switch) then
+       call fire_init()
+    endif
+    if (firegfed_switch) then
+       call firegfed_init()
+    endif
+
+    !-----------------------------------------------------
+    ! Save the fresh new-segment forcing-reader state.
+    ! restart_read() may overwrite this with the terminal
+    ! state from the preceding segment.
+
+    init_driver_step    = driver_step
+    init_driver_perday  = driver_perday
+    init_driver_permon  = driver_permon
+    init_driver_year    = driver_year
+    init_driver_month   = driver_month
+    init_driver_day     = driver_day
+    init_driver_hour    = driver_hour
+    init_driver_recnum  = driver_recnum
+    init_driver_seccur  = driver_seccur
+    init_driver_secnext = driver_secnext
+    init_driver_readf   = driver_readf
+    init_driver_switchf = driver_switchf
+    init_driver_updatef = driver_updatef
+
+    allocate(init_ps2(subcount))
+    allocate(init_tm2(subcount))
+    allocate(init_sh2(subcount))
+    allocate(init_spdm2(subcount))
+    allocate(init_lspr2(subcount))
+    allocate(init_cupr2(subcount))
+    allocate(init_dlwbot2(subcount))
+    allocate(init_sw_dwn2(subcount))
+
+    do i=1,subcount
+        init_ps2(i)      = sib%g(i)%gprogt%ps2
+        init_tm2(i)      = sib%g(i)%gprogt%tm2
+        init_sh2(i)      = sib%g(i)%gprogt%sh2
+        init_spdm2(i)    = sib%g(i)%gprogt%spdm2
+        init_lspr2(i)    = sib%g(i)%gprogt%lspr2
+        init_cupr2(i)    = sib%g(i)%gprogt%cupr2
+        init_dlwbot2(i)  = sib%g(i)%gprogt%dlwbot2
+        init_sw_dwn2(i)  = sib%g(i)%gprogt%sw_dwn2
+    enddo
+
+    if (fire_switch) then
+        init_fire_step    = fire_step
+        init_fire_perday  = fire_perday
+        init_fire_permon  = fire_permon
+        init_fire_year    = fire_year
+        init_fire_month   = fire_month
+        init_fire_day     = fire_day
+        init_fire_hour    = fire_hour
+        init_fire_recnum  = fire_recnum
+        init_fire_seccur  = fire_seccur
+        init_fire_secnext = fire_secnext
+        init_fire_readf   = fire_readf
+        init_fire_switchf = fire_switchf
+        init_fire_updatef = fire_updatef
+
+        allocate(init_firec2(subcount))
+        allocate(init_fireco22(subcount))
+
+        do i=1,subcount
+            init_firec2(i)   = sib%g(i)%gprogt%firec2
+            init_fireco22(i) = sib%g(i)%gprogt%fireco22
+        enddo
+    endif  
+
+ 
+
+    !...read in restart variables
+    call restart_read()
+
+    !-----------------------------------------------------
+    ! Rebase forcing-reader clocks onto the time origin of
+    ! the newly started segment.  A valid restart already
+    ! contains the exact forcing brackets and reader state;
+    ! only the scalar clock origin may differ from sec_tot.
+    !
+    ! Fresh driver_init can be either at the same reader phase as
+    ! the checkpoint or one meteorological record behind it.  This
+    ! depends on where the restart boundary falls in the forcing
+    ! cycle.  Arbitrary-DOY checkpoints that are poised to read can
+    ! match fresh initialization exactly; a Jan-1 continuation can
+    ! already be one record ahead because the preceding segment staged
+    ! the cross-year forcing bracket.
+    !
+    ! Identify the reader phase from checkpoint versus fresh-init
+    ! metadata, then derive only the common scalar clock-origin shift.
+    ! All forcing readers share the same sec_tot time origin, so the
+    ! meteorological shift is also applied to standard fire.
+    !
+    ! Require both saved driver clocks to imply the same origin shift
+    ! before changing either one.  This prevents a bad reader bracket
+    ! from being hidden by the rebase.
+
+    if (trim(ic_mode) .eq. 'restart') then
+
+        ! The checkpoint calendar cursor can be one day ahead of fresh
+        ! driver_init even when both readers are at the same forcing record.
+        ! Therefore identify equal reader phase from record index and flags,
+        ! not from driver_day.  This preserves ordinary arbitrary-DOY restarts.
+        if ((driver_recnum .eq. init_driver_recnum) .and. &
+            (driver_hour .eq. init_driver_hour) .and. &
+            (driver_readf .eqv. init_driver_readf) .and. &
+            (driver_switchf .eqv. init_driver_switchf) .and. &
+            (driver_updatef .eqv. init_driver_updatef)) then
+
+            expected_driver_seccur = init_driver_seccur
+            expected_driver_secnext = init_driver_secnext
+
+        else if ((driver_year .eq. init_driver_year) .and. &
+                 (driver_month .eq. init_driver_month) .and. &
+                 (driver_day .eq. init_driver_day) .and. &
+                 (driver_hour .eq. init_driver_hour + &
+                      init_driver_step/3600) .and. &
+                 (driver_recnum .eq. init_driver_recnum + 1) .and. &
+                 (.not. driver_readf) .and. init_driver_readf .and. &
+                 (driver_updatef .eqv. init_driver_updatef)) then
+
+            expected_driver_seccur = init_driver_seccur + &
+                 int(init_driver_step,long)
+            expected_driver_secnext = init_driver_secnext + &
+                 int(init_driver_step,long)
+
+        else
+            print*,'ERROR: unsupported meteorological restart reader phase'
+            print*,' checkpoint y/m/d/h/rec =',driver_year,driver_month, &
+                 driver_day,driver_hour,driver_recnum
+            print*,' fresh-init y/m/d/h/rec =',init_driver_year, &
+                 init_driver_month,init_driver_day,init_driver_hour, &
+                 init_driver_recnum
+            print*,' checkpoint read/switch/update =',driver_readf, &
+                 driver_switchf,driver_updatef
+            print*,' fresh-init read/switch/update =',init_driver_readf, &
+                 init_driver_switchf,init_driver_updatef
+            stop
+        endif
+
+        driver_clock_offset = driver_seccur - expected_driver_seccur
+
+        if ((driver_secnext - expected_driver_secnext) .ne. &
+            driver_clock_offset) then
+            print*,'ERROR: inconsistent meteorological restart clocks'
+            print*,' driver_seccur           =',driver_seccur
+            print*,' driver_secnext          =',driver_secnext
+            print*,' expected local seccur   =',expected_driver_seccur
+            print*,' expected local secnext  =',expected_driver_secnext
+            stop
+        endif
+
+        print*,'Rebasing meteorological restart clocks by', &
+             driver_clock_offset,' seconds'
+
+        driver_seccur  = driver_seccur  - driver_clock_offset
+        driver_secnext = driver_secnext - driver_clock_offset
+
+        if (driver_readf .and. (driver_seccur .ne. sec_tot)) then
+            print*,'ERROR: rebased driver_readf clock does not match sec_tot'
+            print*,' driver_seccur =',driver_seccur
+            print*,' sec_tot       =',sec_tot
+            stop
+        endif
+
+        if (fire_switch) then
+            ! Standard fire uses the same sec_tot origin as meteorology.
+            ! Do not derive a separate offset from fresh fire_init because
+            ! a checkpoint can legitimately be poised to read at sec_tot.
+            fire_clock_offset = driver_clock_offset
+
+            print*,'Rebasing standard-fire restart clocks by', &
+                 fire_clock_offset,' seconds'
+
+            fire_seccur  = fire_seccur  - fire_clock_offset
+            fire_secnext = fire_secnext - fire_clock_offset
+
+            ! If the checkpoint says a fire read is already due, its rebased
+            ! clock must coincide with the current restarted model time.
+            if (fire_readf .and. (fire_seccur .ne. sec_tot)) then
+                print*,'ERROR: rebased fire_readf clock does not match sec_tot'
+                print*,' fire_seccur =',fire_seccur
+                print*,' sec_tot     =',sec_tot
+                stop
+            endif
+        endif
+
+    endif
+
+
+    !-----------------------------------------------------
+    ! Legacy repair for old terminalized checkpoints.
+    ! Healthy checkpoints produced by the corrected
+    ! driver_update/fire_update logic will not enter this
+    ! block because updatef remains true.  Retain it only
+    ! during the clock-rebase validation so old diagnostic
+    ! restart files remain usable; remove it after the new
+    ! checkpoint path is fully validated.
+    !-----------------------------------------------------
+    ! Repair terminal forcing-reader state at a segment
+    ! boundary for exact restart continuation.
+    !
+    ! A final restart written at the end of a segment may
+    ! contain a terminalized forcing reader:
+    !   updatef = .false.
+    !   recnum  > permon
+    !
+    ! The fresh driver_init/fire_init above have already
+    ! opened and positioned the forcing files for the new
+    ! segment.  Reconstruct the same forcing brackets and
+    ! control state that an uninterrupted run would have.
+
+    terminal_driver_restart = .false.
+    terminal_fire_restart   = .false.
+
+    if (trim(ic_mode) .eq. 'restart') then
+
+        terminal_driver_restart = &
+             (.not. driver_updatef) .and. &
+             (driver_recnum .gt. driver_permon) .and. &
+             init_driver_updatef
+
+        if (fire_switch) then
+            terminal_fire_restart = &
+                 (.not. fire_updatef) .and. &
+                 (fire_recnum .gt. fire_permon) .and. &
+                 init_fire_updatef
+        endif
+
+    endif
+
+
+    !-----------------------------------------------------
+    ! Meteorological driver
+    !
+    ! For the grouped/global reader:
+    !   checkpoint *2 = final old-segment forcing value
+    !   fresh-init *2 = first new-segment forcing value
+    !
+    ! Exact uninterrupted continuation requires:
+    !   repaired *1 = checkpoint *2
+    !   repaired *2 = fresh-init *2
+
+    if (terminal_driver_restart) then
+
+        if (single_pt) then
+            print*,'ERROR: terminal restart driver repair has'
+            print*,'not yet been validated for single-point mode.'
+            stop
+        endif
+
+        print*,'Repairing terminal meteorological restart state'
+
+        do i=1,subcount
+
+            sib%g(i)%gprogt%ps1       = sib%g(i)%gprogt%ps2
+            sib%g(i)%gprogt%tm1       = sib%g(i)%gprogt%tm2
+            sib%g(i)%gprogt%sh1       = sib%g(i)%gprogt%sh2
+            sib%g(i)%gprogt%spdm1     = sib%g(i)%gprogt%spdm2
+            sib%g(i)%gprogt%lspr1     = sib%g(i)%gprogt%lspr2
+            sib%g(i)%gprogt%cupr1     = sib%g(i)%gprogt%cupr2
+            sib%g(i)%gprogt%dlwbot1   = sib%g(i)%gprogt%dlwbot2
+            sib%g(i)%gprogt%sw_dwn1   = sib%g(i)%gprogt%sw_dwn2
+
+            sib%g(i)%gprogt%ps2       = init_ps2(i)
+            sib%g(i)%gprogt%tm2       = init_tm2(i)
+            sib%g(i)%gprogt%sh2       = init_sh2(i)
+            sib%g(i)%gprogt%spdm2     = init_spdm2(i)
+            sib%g(i)%gprogt%lspr2     = init_lspr2(i)
+            sib%g(i)%gprogt%cupr2     = init_cupr2(i)
+            sib%g(i)%gprogt%dlwbot2   = init_dlwbot2(i)
+            sib%g(i)%gprogt%sw_dwn2   = init_sw_dwn2(i)
+
+        enddo
+
+        driver_step    = init_driver_step
+        driver_perday  = init_driver_perday
+        driver_permon  = init_driver_permon
+
+        driver_year    = init_driver_year
+        driver_month   = init_driver_month
+        driver_day     = init_driver_day
+
+        ! Fresh global initialization is one driver record
+        ! behind the uninterrupted boundary state.
+        driver_hour    = init_driver_hour + init_driver_step/3600
+        driver_recnum  = init_driver_recnum + 1
+        driver_seccur  = init_driver_seccur + init_driver_step
+        driver_secnext = init_driver_secnext + init_driver_step
+
+        driver_readf   = .false.
+        driver_switchf = .false.
+        driver_updatef = .true.
+
+    endif
+
+
+    !-----------------------------------------------------
+    ! Standard-fire driver
+    !
+    ! fire_init already leaves its scalar control state at
+    ! the correct new-segment position.  Only reconstruct
+    ! the cross-boundary forcing brackets, then restore the
+    ! fresh-init scalar state.
+
+    if (terminal_fire_restart) then
+
+        print*,'Repairing terminal standard-fire restart state'
+
+        do i=1,subcount
+
+            sib%g(i)%gprogt%firec1   = sib%g(i)%gprogt%firec2
+            sib%g(i)%gprogt%fireco21 = sib%g(i)%gprogt%fireco22
+
+            sib%g(i)%gprogt%firec2   = init_firec2(i)
+            sib%g(i)%gprogt%fireco22 = init_fireco22(i)
+
+        enddo
+
+        fire_step    = init_fire_step
+        fire_perday  = init_fire_perday
+        fire_permon  = init_fire_permon
+
+        fire_year    = init_fire_year
+        fire_month   = init_fire_month
+        fire_day     = init_fire_day
+        fire_hour    = init_fire_hour
+        fire_recnum  = init_fire_recnum
+        fire_seccur  = init_fire_seccur
+        fire_secnext = init_fire_secnext
+
+        fire_readf   = init_fire_readf
+        fire_switchf = init_fire_switchf
+        fire_updatef = init_fire_updatef
+
+    endif
+
+
+
+
+    !...setup sib diagnostic variables
+    call sibtype_setup()
+
+
+    !...initialize output
+    call output_init()
+
+
+    !...reset pools for continuing spinup
+    if (spinup_continue) then
+      call set_continue_spinup()
+    endif
+
+    print*,''
+    if (spinup .and. (.not. spinup_continue)) print*,'Starting Spinup Simulation'
+    if (spinup .and. spinup_continue) print*,'Continuing Spinup Simulation'
+
+    print*,'Starting timestep loop'
+    do while ((spinup_lnum .le. spinup_maxiter) .and. (.not. spinup_done))
+
+        !...timestep loop
+        do t = start_second, end_second - dtsib, dtsib
+           if (new_year) then
+             print('(a,i4)'),' Processing: ', year
+           endif
+
+           do i=1,subcount
+             !itb...reset accumulated potential ET
+             sib%g(i)%l%fluxt%et0a = 0.0
+             sib%g(i)%l%fluxt%et1a = 0.0
+             !itb...reset growing season diagnostics
+             do n=1,7
+               sib%g(i)%l%co2t%gs_stress(n) = 0.0
+             enddo
+           enddo
+
+          if (new_month .and. show_mon_info) then
+              !...Print output information once a month
+              call print_moninfo()
+          endif
+
+          if (new_day) then
+               !...Calculate solar declination 
+               call solar_dec(doy, cureqnx, lonearth, &
+                    sin_dec, cos_dec, tan_dec)
+
+               !...Calculate day length
+               call day_length(subcount, pi180, tan_dec, sublatsib, &
+                    sib%g%gdiagt%daylen, sib%g%gdiagt%daylendt)
+           endif !new_day
+
+           !...Prepare driver meteorology
+           call driver_update()
+
+
+
+
+           if (tm5mr_switch) then
+               !...Prepare tm5 data !ARACHO
+               call tm5_update(sib%g%gprogt)
+           endif
+
+           !...Prepare fire emissions/burned area
+           if (fire_switch) then
+              call fire_update()
+           endif
+           if (firegfed_switch) then
+              call firegfed_update()
+           endif
+           
+
+           !...loop over points    
+           do i = 1, subcount
+              if (.not. sib%g(i)%gdiagt%gridcell_spunup) then
+     
+                  !...Interpolate driver data each time step
+                  call driver_interp(i, sublonsib(i), sublatsib(i), &
+                       sib%g(i)%gdiagt, sib%g(i)%gprogt)
+
+                  if (tm5mr_switch) then
+                       !...Interpolate tm5 data each time step !ARACHO
+                       call tm5_interp(i, sublonsib(i), sublatsib(i), &
+                            sib%g(i)%gdiagt, sib%g(i)%gprogt)
+                  endif
+
+                  !...Interpolate fire emissions/burned area each time step
+                  if (fire_switch) then
+                     call fire_interp(i, sublonsib(i), sublatsib(i), &
+                          sib%g(i))
+
+                  endif
+                  if (firegfed_switch) then
+                     call firegfed_interp(i, sublonsib(i), sublatsib(i), &
+                          sib%g(i))
+                  endif
+
+                  !call fire_interp_c13(i, sublonsib(i), sublatsib(i), &
+                  !     sib%g(i), physcon(pnum))
+
+                  !...Set CO2 values
+                  !if (varco2_switch) then
+                  if (new_day) then
+                    call set_co2( year, nmonth, sib%g(i)%gprogt )
+                  endif
+                  !endif
+
+                  call set_cos(sib%g(i)%gprogt)
+
+
+                  !...Call SiB control
+                  call sib_control(i, subset(i),   &
+                       sublonsib(i), sublatsib(i), &
+                       new_day_lst(i), daylenmax(i), &
+                       doy, sib%g(i))
+
+
+                  !...Save gridcell diagnostics
+                  call diagnostic_save_gall( &
+                       i, sib%g(i), sib%g(i)%gprogt )
+
+                endif !.not. gridcell_spunup
+           enddo  !i=1,subcount
+
+           !...Set CO2 values
+           !if (varco2_switch) then
+           !  if (new_day) then
+           !    call set_co2( year, nmonth )
+           !  endif
+           !endif
+
+           !...Set COS values
+           !if (new_day) then
+           !call set_cos(sib%g%gprogt)
+           !endif
+
+           !...Increment the time
+           call time_manager()
+
+
+           !...Write any requested output
+           call output_control()
+
+           !...Calculate and write the equilibrium pools if necessary
+           call equipools_control()
+
+        enddo ! timestep loop
+    enddo ! spinup loop
+
+    !...Ensure all files have been closed
+    call output_closer()
+
+    !...Print final message
+    total = etime(elapsed)
+    print*, ''
+    print*, 'Times: total=', total, ' user=', elapsed(1),' system=', elapsed(2)
+    print*, 'End Simulation'
+    print*,''
+
+end program sibdrive
+
+!====================================
+subroutine parse_args(rank, nchunks)
+    integer, intent(out) :: rank, nchunks
+
+    character(len=16) :: buf
+
+    call getarg(1, buf)
+    if (buf == '' .or. buf == '>') then
+        rank = 1
+        nchunks = 1
+    else
+        read(buf, *) rank
+        call getarg(2, buf)
+        if (buf == '' .or. buf == '>') then
+            stop 'Command line arguments incorrect:  SiBD4 rank nchunks'
+        else
+            read(buf, *) nchunks
+            if (rank > nchunks) stop 'rank greater than nchunks'
+            if (rank < 1 .or. nchunks < 1) stop 'rank or nchunks < 1'
+        endif
+    endif
+end subroutine parse_args
+
+!===================================
+subroutine parse_name( namel_name )
+    character(len=120), intent(out) :: namel_name
+
+    character(len=120) :: buf
+
+    call getarg(1, buf)
+    if (buf == '' .or. buf == '>') then
+        namel_name = 'namel_sibdrv'
+    else
+        namel_name = buf
+    endif
+end subroutine parse_name
+
+!===========================
+subroutine print_moninfo()
+
+use module_io
+use module_pparams, only: &
+    month_names
+use module_time
+
+implicit none
+
+integer(i4) :: indx1, indx2, xmoni, xmon
+character(len=10) :: lstring
+
+!-----------------------------------------------------------
+print('(a,a,i6)'),'     ',month_names(month), year
+
+!.....driver data information
+print('(a)'),'     Driver Data: '
+indx1 = INDEX(driver_filename,'/',back=.true.)
+if (indx1 .gt. 1) then
+   indx1 = INDEX(driver_filename(1:indx1-1),'/',back=.true.)
+endif
+if (indx1 .gt. 1) then
+   indx1 = INDEX(driver_filename(1:indx1-1),'/',back=.true.)
+endif
+if (indx1 .gt. 1) then
+   lstring = '       ...'
+else
+   lstring = '          '
+   indx1 = 1
+endif
+indx2 = len(driver_filename)
+print('(a,a)'),lstring,trim(driver_filename(indx1:indx2))
+
+!.....restart information
+IF (restart_savef) THEN
+    IF (restart_dtsib .GT. 0) THEN
+        print('(a)'),' Writing Restart Output'
+    ELSE
+        xmoni = index(trim(restart_filename),'sib_r')
+        read(restart_filename(xmoni+9:xmoni+10),'(i2)') xmon
+        if (xmon .EQ. month) then
+            print('(a)'),'     Restart Output: '
+            indx1 = INDEX(restart_filename,'/',back=.true.)
+            if (indx1 .gt. 1) then
+               indx1 = INDEX(restart_filename(1:indx1-1),'/',back=.true.)
+            endif
+            if (indx1 .gt. 1) then
+               indx1 = INDEX(restart_filename(1:indx1-1),'/',back=.true.)
+            endif
+            if (indx1 .gt. 1) then
+               lstring = '       ...'
+            else
+               lstring = '          '
+              indx1 = 1
+            endif
+            indx2 = len(restart_filename)
+            print('(a,a)'),lstring,trim(restart_filename(indx1:indx2))
+        endif
+     ENDIF
+ENDIF
+
+!.....diagnostic output information
+IF ((hr_savegf) .OR. (hr_saveluf)) THEN
+    xmoni = index(trim(hr_filenameg),'hsib_')
+    read(hr_filenameg(xmoni+9:xmoni+10),'(i2)') xmon
+    if (xmon .EQ. month) then
+        print('(a)'),'     HR Output: '
+        IF (hr_savegf)  print('(a,a)'),'      ',trim(hr_filenameg)
+        IF (hr_saveluf) print('(a,a)'),'      ',trim(hr_filenamelu)
+    endif
+ENDIF
+IF ((pbp_savegf) .OR. (pbp_saveluf)) THEN
+    xmoni = index(trim(pbp_filenameg),'psib_')
+    read(pbp_filenameg(xmoni+9:xmoni+10),'(i2)') xmon
+    if (xmon .EQ. month) then
+       print('(a)'),'     PBP Output: '
+       IF (pbp_savegf)  print('(a,a)'),'      ',trim(pbp_filenameg)
+       IF (pbp_saveluf) print('(a,a)'),'      ',trim(pbp_filenamelu)
+    endif
+ENDIF
+IF ((qp_savegf) .OR. (qp_saveluf)) THEN
+    xmoni = index(trim(qp_filenameg),'qsib_')
+    read(qp_filenameg(xmoni+9:xmoni+10),'(i2)') xmon
+    if (xmon .EQ. month) then
+        print('(a)'),'     QP Output: '
+        IF (qp_savegf)  print('(a,a)'),'      ',trim(qp_filenameg)
+        IF (qp_saveluf) print('(a,a)'),'      ',trim(qp_filenamelu)
+     endif
+ENDIF
+print('(a)'),''
+
+end subroutine print_moninfo
