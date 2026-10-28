@@ -35,13 +35,7 @@ Development-stage features should not be interpreted as validated scientific fin
 
 ## Obtaining the code
 
-Clone the repository using Git:
-
-`git clone https://github.com/aleya-kaushik/c13c14_fireba_r.git`
-
-`cd c13c14_fireba_r`
-
-For reproducible use, record the exact commit with `git rev-parse HEAD`.
+Since this is a development version, please contact aleya.kaushik@colorado.edu to discuss collaboration.
 
 **Build and run instructions:** SiB4 is a compiled Fortran model with external input data and configuration requirements. The precise build commands, compiler dependencies, input-file layout, and example run settings for this published repository still need to be documented and verified against its source tree. Please do not assume that cloning the repository alone provides a complete, runnable experiment.
 
